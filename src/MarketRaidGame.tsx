@@ -558,12 +558,38 @@ export function MarketRaidGame() {
 
       {state.gameOver && (
         <div className="fixed inset-0 flex items-center justify-center bg-black/70">
-          <div className="rounded border border-red-500 bg-slate-950 p-8 text-center shadow-xl">
-            <div className="mb-2 text-3xl font-black text-red-400">
+          <div className="max-w-xl rounded border border-red-500 bg-slate-950 p-8 text-center shadow-xl">
+            <div className="mb-4 text-3xl font-black text-red-400">
               MARKET WIPE
             </div>
-            <div className="mb-6 text-slate-300">
-              All stocks have hit zero health.
+            <div className="mb-6 space-y-3 text-left text-sm leading-relaxed text-slate-300">
+              <p>
+                The last ticker flatlines and the floor goes silent. Every
+                position you swore you could heal has bled out to zero, and the
+                margin call that follows is not a phone up &mdash; it is a
+                certified letter, a locksmith, and two polite men in windbreakers.
+              </p>
+              <p>
+                Your broker has taken possession of the house. The locks are
+                changed by noon. Your wife has changed the locks on the
+                marriage too: she takes the kids, the dog, and the good
+                blender, and leaves you the folding chair and the framed
+                &ldquo;BUY THE DIP&rdquo; poster nobody else wanted. Your
+                mother-in-law, who always knew, says nothing &mdash; which is
+                worse.
+              </p>
+              <p>
+                The Lamborghini was a lease. The yacht was a rendering. Your
+                Robinhood notifications keep buzzing in a pocket that is no
+                longer attached to any pants you own. The raid chat, once
+                begging you for heals, has moved on to a new healer and is
+                already talking about the Strait of Hormuz again.
+              </p>
+              <p className="italic text-slate-400">
+                You are now, in the truest financial sense, fully diversified
+                across nothing. Touch grass. Or click below and tell yourself
+                this time will be different.
+              </p>
             </div>
             <button
               className="rounded bg-red-600 px-4 py-2 font-bold hover:bg-red-500"
