@@ -100,7 +100,7 @@ const MARGIN_REGEN_PER_SECOND = 3;
 
 // Global multiplier on all incoming stock damage. Below the boss's enrage
 // threshold it doubles — the bear thrashes harder as it dies.
-const MARKET_DAMAGE_SCALE = 0.8;
+const MARKET_DAMAGE_SCALE = 0.75;
 const MARKET_DAMAGE_SCALE_ENRAGE = 2;
 const BOSS_ENRAGE_THRESHOLD = 0.5; // fraction of boss HP that triggers enrage
 
@@ -121,6 +121,9 @@ const BOSS_HIT_MAX_MS = 1200;
 const BOSS_HIT_DMG_MIN = 0.105;
 const BOSS_HIT_DMG_MAX = 0.3;
 const BOSS_DPS_ALIVE_EXP = 5;
+// Guaranteed minimum chip per hit while at least one stock is alive, so a badly
+// wounded market still makes slow-but-real progress instead of stalling at zero.
+const BOSS_HIT_DMG_FLOOR = 0.03;
 
 // Things a panicked raider yells when they're hurting.
 const CHAT_LINES = [
@@ -296,7 +299,10 @@ export function reducer(state: GameState, action: Action): GameState {
       if (action.now >= next.primarySectorUntil) {
         next = {
           ...next,
-          primarySectorId: randomSectorId(),
+          primarySectorId: randomActiveSectorId(
+            next.stocks,
+            next.primarySectorId,
+          ),
           primarySectorUntil: action.now + randomBetween(10_000, 20_000),
         };
       }
@@ -335,9 +341,11 @@ export function reducer(state: GameState, action: Action): GameState {
       if (action.now >= next.nextBossHitAt) {
         const aliveFraction =
           stocks.length > 0 ? aliveCount / stocks.length : 0;
-        const hit =
+        const scaled =
           randomBetween(BOSS_HIT_DMG_MIN, BOSS_HIT_DMG_MAX) *
           Math.pow(aliveFraction, BOSS_DPS_ALIVE_EXP);
+        // Always deal at least the floor while any stock is alive.
+        const hit = aliveCount > 0 ? Math.max(BOSS_HIT_DMG_FLOOR, scaled) : 0;
         next = {
           ...next,
           bossHp: Math.max(0, next.bossHp - hit),
@@ -1157,6 +1165,18 @@ function aliveStocksInSector(
 
 function randomSectorId() {
   return randomItem(sectors as RectLayout[])?.id ?? "technology";
+}
+
+// Pick a sector that still has at least one living stock, so the raid never
+// focuses a group that's already fully wiped.
+function randomActiveSectorId(
+  stockStates: Record<StockId, StockState>,
+  fallback: SectorId,
+): SectorId {
+  const active = (sectors as RectLayout[]).filter(
+    (sec) => aliveStocksInSector(sec.id, stockStates).length > 0,
+  );
+  return randomItem(active)?.id ?? fallback;
 }
 
 function randomItem<T>(items: T[]): T | undefined {
