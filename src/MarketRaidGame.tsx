@@ -32,6 +32,7 @@ type ChatMessage = {
   ticker: string;
   text: string;
   at: number;
+  kind?: "say" | "announce";
 };
 
 type CastState = {
@@ -52,9 +53,14 @@ type GameState = {
   primarySectorUntil: number;
   nextDamageAt: number;
   nextFlavorAt: number;
+  nextBossHitAt: number;
   startedAt: number;
   now: number;
+  bossHp: number;
+  bossMaxHp: number;
+  enrageAnnounced: boolean;
   gameOver: boolean;
+  gameWon: boolean;
   chat: ChatMessage[];
 };
 
@@ -90,7 +96,31 @@ const SPELLS: Record<SpellId, Spell> = {
   },
 };
 
-const MARGIN_REGEN_PER_SECOND = 5;
+const MARGIN_REGEN_PER_SECOND = 3;
+
+// Global multiplier on all incoming stock damage. Below the boss's enrage
+// threshold it doubles — the bear thrashes harder as it dies.
+const MARKET_DAMAGE_SCALE = 0.8;
+const MARKET_DAMAGE_SCALE_ENRAGE = 2;
+const BOSS_ENRAGE_THRESHOLD = 0.5; // fraction of boss HP that triggers enrage
+
+// The encounter. You "damage" the bear by keeping the market alive: the raid's
+// DPS scales with the average health of all stocks, so a topped-off market
+// burns the boss down fast, while a bleeding one barely scratches him.
+const BOSS_NAME = "Bearthazar, the Liquidator";
+const BOSS_MAX_HP = 100;
+// The boss takes small, random chip damage over time — the rest of the market
+// "fighting back". The damage scales with how many stocks are still alive, so
+// every death you let happen slows the kill (and a wipe ends the fight).
+const BOSS_HIT_MIN_MS = 500;
+const BOSS_HIT_MAX_MS = 1200;
+// Chip damage to the boss, scaled by alive-fraction (raised to this power) at
+// hit time — so the more of the market has died, the sharply less damage the
+// boss takes. A bleeding market barely scratches it; a healthy one kills it in
+// ~7 minutes. The steep exponent is what makes neglect a losing strategy.
+const BOSS_HIT_DMG_MIN = 0.105;
+const BOSS_HIT_DMG_MAX = 0.3;
+const BOSS_DPS_ALIVE_EXP = 5;
 
 // Things a panicked raider yells when they're hurting.
 const CHAT_LINES = [
@@ -149,12 +179,14 @@ function appendChat(
   ticker: string,
   text: string,
   now: number,
+  kind: ChatMessage["kind"] = "say",
 ): ChatMessage[] {
   const message: ChatMessage = {
     id: `${ticker}-${now}-${chatSeq++}`,
     ticker,
     text,
     at: now,
+    kind,
   };
   return [...chat, message].slice(-CHAT_MAX_MESSAGES);
 }
@@ -180,9 +212,14 @@ export function makeInitialState(now: number): GameState {
     primarySectorUntil: now + randomBetween(10_000, 20_000),
     nextDamageAt: now + 1000,
     nextFlavorAt: now + randomBetween(FLAVOR_MIN_MS, FLAVOR_MAX_MS),
+    nextBossHitAt: now + randomBetween(BOSS_HIT_MIN_MS, BOSS_HIT_MAX_MS),
     startedAt: now,
     now,
+    bossHp: BOSS_MAX_HP,
+    bossMaxHp: BOSS_MAX_HP,
+    enrageAnnounced: false,
     gameOver: false,
+    gameWon: false,
     chat: [],
   };
 }
@@ -236,7 +273,7 @@ export function reducer(state: GameState, action: Action): GameState {
     }
 
     case "TICK": {
-      if (state.gameOver) {
+      if (state.gameOver || state.gameWon) {
         return {
           ...state,
           now: action.now,
@@ -276,7 +313,8 @@ export function reducer(state: GameState, action: Action): GameState {
                 action.now,
               )
             : next.chat,
-          nextFlavorAt: action.now + randomBetween(FLAVOR_MIN_MS, FLAVOR_MAX_MS),
+          nextFlavorAt:
+            action.now + randomBetween(FLAVOR_MIN_MS, FLAVOR_MAX_MS),
         };
       }
 
@@ -292,7 +330,48 @@ export function reducer(state: GameState, action: Action): GameState {
         (s) => s.alive,
       ).length;
 
-      if (aliveCount === 0) {
+      // The boss chips down over time; the more of the market is dead, the
+      // fewer fighters are left, so the less damage it takes.
+      if (action.now >= next.nextBossHitAt) {
+        const aliveFraction =
+          stocks.length > 0 ? aliveCount / stocks.length : 0;
+        const hit =
+          randomBetween(BOSS_HIT_DMG_MIN, BOSS_HIT_DMG_MAX) *
+          Math.pow(aliveFraction, BOSS_DPS_ALIVE_EXP);
+        next = {
+          ...next,
+          bossHp: Math.max(0, next.bossHp - hit),
+          nextBossHitAt:
+            action.now + randomBetween(BOSS_HIT_MIN_MS, BOSS_HIT_MAX_MS),
+        };
+      }
+
+      // Enrage: once the boss drops below the threshold, the raid leader calls
+      // it out (once) and incoming damage doubles (handled in damageStock).
+      if (
+        !next.enrageAnnounced &&
+        next.bossHp / next.bossMaxHp < BOSS_ENRAGE_THRESHOLD
+      ) {
+        next = {
+          ...next,
+          enrageAnnounced: true,
+          chat: appendChat(
+            next.chat,
+            "NVDA Raid Leader",
+            "SoftBank gone under! Margin calls everywhere!",
+            action.now,
+            "announce",
+          ),
+        };
+      }
+
+      if (next.bossHp <= 0) {
+        next = {
+          ...next,
+          gameWon: true,
+          cast: undefined,
+        };
+      } else if (aliveCount === 0) {
         next = {
           ...next,
           gameOver: true,
@@ -408,7 +487,11 @@ function damageStock(
   const current = state.stocks[stockId];
   if (!current?.alive) return state;
 
-  const nextHp = Math.max(0, current.hp - amount);
+  // The bear enrages below the threshold, doubling all incoming stock damage.
+  const enraged = state.bossHp / state.bossMaxHp < BOSS_ENRAGE_THRESHOLD;
+  const scale = enraged ? MARKET_DAMAGE_SCALE_ENRAGE : MARKET_DAMAGE_SCALE;
+
+  const nextHp = Math.max(0, current.hp - amount * scale);
   const alive = nextHp > 0;
 
   let chat = state.chat;
@@ -429,7 +512,12 @@ function damageStock(
       offCooldown &&
       roll(CHAT_SPEAK_CHANCE)
     ) {
-      chat = appendChat(chat, stockId, randomItem(CHAT_LINES) ?? "heal me!", now);
+      chat = appendChat(
+        chat,
+        stockId,
+        randomItem(CHAT_LINES) ?? "heal me!",
+        now,
+      );
       lastSpokeAt = now;
     }
   }
@@ -491,7 +579,10 @@ export function MarketRaidGame() {
         dispatch({ type: "CANCEL_CAST" });
       }
 
-      if (event.key.toLowerCase() === "r" && state.gameOver) {
+      if (
+        event.key.toLowerCase() === "r" &&
+        (state.gameOver || state.gameWon)
+      ) {
         dispatch({ type: "RESTART", now: performance.now() });
       }
     };
@@ -499,59 +590,61 @@ export function MarketRaidGame() {
     window.addEventListener("keydown", onKeyDown);
 
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [state.gameOver]);
+  }, [state.gameOver, state.gameWon]);
 
   return (
     <div className="flex h-screen gap-3 bg-slate-950 p-3 text-white">
       <div className="flex min-w-0 flex-1 flex-col gap-3">
-      <div className="flex items-center justify-between rounded border border-slate-700 bg-slate-900 px-3 py-2">
-        <div>
-          <div className="text-sm uppercase tracking-wide text-slate-400">
-            Market Raid
+        <div className="flex items-center justify-between rounded border border-slate-700 bg-slate-900 px-3 py-2">
+          <div>
+            <div className="text-sm uppercase tracking-wide text-slate-400">
+              Market Raid
+            </div>
+            <div className="text-xl font-bold">S&amp;P 500 Healer Frame</div>
           </div>
-          <div className="text-xl font-bold">S&amp;P 500 Healer Frame</div>
+
+          <div className="text-right">
+            <div className="text-sm text-slate-400">Rotation out of</div>
+            <div className="font-bold uppercase text-orange-300">
+              {state.primarySectorId}
+            </div>
+          </div>
+
+          <div className="text-right">
+            <div className="text-sm text-slate-400">Alive</div>
+            <div className="font-bold">
+              {aliveCount} / {stocks.length}
+            </div>
+          </div>
         </div>
 
-        <div className="text-right">
-          <div className="text-sm text-slate-400">Rotation out of</div>
-          <div className="font-bold uppercase text-orange-300">
-            {state.primarySectorId}
-          </div>
+        <BossBar name={BOSS_NAME} hp={state.bossHp} maxHp={state.bossMaxHp} />
+
+        <div className="min-h-0 flex-1 overflow-hidden rounded border border-slate-700 bg-black">
+          <MarketRaidMap
+            state={state}
+            onStockClick={(stockId) =>
+              dispatch({
+                type: "CLICK_STOCK",
+                stockId,
+                now: performance.now(),
+              })
+            }
+          />
         </div>
 
-        <div className="text-right">
-          <div className="text-sm text-slate-400">Alive</div>
-          <div className="font-bold">
-            {aliveCount} / {stocks.length}
-          </div>
+        <CastBar state={state} />
+
+        <div className="grid grid-cols-[1fr_auto] gap-4">
+          <MarginBar margin={state.margin} maxMargin={state.maxMargin} />
+
+          <SpellBar
+            selectedSpellId={state.selectedSpellId}
+            onSelectSpell={(spellId) =>
+              dispatch({ type: "SELECT_SPELL", spellId })
+            }
+          />
         </div>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-hidden rounded border border-slate-700 bg-black">
-        <MarketRaidMap
-          state={state}
-          onStockClick={(stockId) =>
-            dispatch({
-              type: "CLICK_STOCK",
-              stockId,
-              now: performance.now(),
-            })
-          }
-        />
-      </div>
-
-      <CastBar state={state} />
-
-      <div className="grid grid-cols-[1fr_auto] gap-4">
-        <MarginBar margin={state.margin} maxMargin={state.maxMargin} />
-
-        <SpellBar
-          selectedSpellId={state.selectedSpellId}
-          onSelectSpell={(spellId) =>
-            dispatch({ type: "SELECT_SPELL", spellId })
-          }
-        />
-      </div>
       </div>
 
       <ChatPanel messages={state.chat} />
@@ -567,16 +660,16 @@ export function MarketRaidGame() {
                 The last ticker flatlines and the floor goes silent. Every
                 position you swore you could heal has bled out to zero, and the
                 margin call that follows is not a phone up &mdash; it is a
-                certified letter, a locksmith, and two polite men in windbreakers.
+                certified letter, a locksmith, and two polite men in
+                windbreakers.
               </p>
               <p>
                 Your broker has taken possession of the house. The locks are
-                changed by noon. Your wife has changed the locks on the
-                marriage too: she takes the kids, the dog, and the good
-                blender, and leaves you the folding chair and the framed
-                &ldquo;BUY THE DIP&rdquo; poster nobody else wanted. Your
-                mother-in-law, who always knew, says nothing &mdash; which is
-                worse.
+                changed by noon. Your wife has changed the locks on the marriage
+                too: she takes the kids, the dog, and the good blender, and
+                leaves you the folding chair and the framed &ldquo;BUY THE
+                DIP&rdquo; poster nobody else wanted. Your mother-in-law, who
+                always knew, says nothing &mdash; which is worse.
               </p>
               <p>
                 The Lamborghini was a lease. The yacht was a rendering. Your
@@ -602,6 +695,49 @@ export function MarketRaidGame() {
           </div>
         </div>
       )}
+
+      {state.gameWon && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black/70">
+          <div className="max-w-xl rounded border border-emerald-400 bg-slate-950 p-8 text-center shadow-xl">
+            <div className="mb-4 text-3xl font-black text-emerald-300">
+              BOSS DOWN
+            </div>
+            <div className="mb-6 space-y-3 text-left text-sm leading-relaxed text-slate-300">
+              <p>
+                {BOSS_NAME} lets out one final, guttural margin call and topples
+                face-first into the trading floor. The bear is dead. Green
+                candles erupt across every sector like fireworks; somewhere a
+                CNBC anchor faints from joy.
+              </p>
+              <p>
+                You kept the market breathing through splash damage, focused
+                hits, and that one terrifying stretch where Energy was
+                hemorrhaging out. The raid &mdash; your raid &mdash; carried the
+                kill, and they know exactly who topped them off the whole way.
+                The chat is just &ldquo;GG HEALER&rdquo; on repeat now.
+              </p>
+              <p>
+                The brokers return your house keys with a fruit basket. Your
+                wife texts back. The Lamborghini is, against all odds, suddenly
+                real. Tendies rain from the heavens. You are, in the truest
+                financial sense, absolutely diamond-handed.
+              </p>
+              <p className="italic text-slate-400">
+                Bask in it. Then go again &mdash; the bear always respawns, and
+                the market never stays healed for long.
+              </p>
+            </div>
+            <button
+              className="rounded bg-emerald-600 px-4 py-2 font-bold hover:bg-emerald-500"
+              onClick={() =>
+                dispatch({ type: "RESTART", now: performance.now() })
+              }
+            >
+              Pull Again
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -623,12 +759,19 @@ function ChatPanel({ messages }: { messages: ChatMessage[] }) {
         {messages.length === 0 ? (
           <div className="text-slate-600">The raid is quiet... for now.</div>
         ) : (
-          messages.map((m) => (
-            // Classic WoW /raid channel coral-orange — whole line one color.
-            <div key={m.id} className="mb-0.5 text-[#ff7f4d]">
-              [Raid] [{m.ticker}]: {m.text}
-            </div>
-          ))
+          messages.map((m) =>
+            m.kind === "announce" ? (
+              // Raid-leader callout — its own bold style, no [Raid] prefix.
+              <div key={m.id} className="mb-0.5 font-bold text-amber-300">
+                [{m.ticker}] {m.text}
+              </div>
+            ) : (
+              // Classic WoW /raid channel coral-orange — whole line one color.
+              <div key={m.id} className="mb-0.5 text-[#ff7f4d]">
+                [Raid] [{m.ticker}]: {m.text}
+              </div>
+            ),
+          )
         )}
         <div ref={endRef} />
       </div>
@@ -841,6 +984,41 @@ function StockTile({
         </text>
       )}
     </g>
+  );
+}
+
+function BossBar({
+  name,
+  hp,
+  maxHp,
+}: {
+  name: string;
+  hp: number;
+  maxHp: number;
+}) {
+  const pct = clamp(hp / maxHp, 0, 1);
+
+  return (
+    <div className="rounded border border-red-900 bg-slate-900 p-2 shadow-inner">
+      <div className="mb-1 flex items-baseline justify-between px-1">
+        <span className="text-sm font-black uppercase tracking-wide text-red-300">
+          {name}
+        </span>
+        <span className="font-mono text-xs text-slate-300">
+          {Math.ceil(pct * 100)}%
+        </span>
+      </div>
+
+      <div className="relative h-7 overflow-hidden rounded border border-red-950 bg-black">
+        <div
+          className="h-full bg-linear-to-b from-red-500 to-red-800 transition-[width] duration-150 ease-linear"
+          style={{ width: `${pct * 100}%` }}
+        />
+        <div className="absolute inset-0 flex items-center justify-center text-xs font-bold text-white drop-shadow">
+          {Math.ceil(hp)} / {maxHp}
+        </div>
+      </div>
+    </div>
   );
 }
 
