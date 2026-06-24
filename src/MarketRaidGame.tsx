@@ -54,6 +54,7 @@ type GameState = {
   nextDamageAt: number;
   nextFlavorAt: number;
   nextBossHitAt: number;
+  lastCastAt?: number;
   startedAt: number;
   now: number;
   bossHp: number;
@@ -96,7 +97,11 @@ const SPELLS: Record<SpellId, Spell> = {
   },
 };
 
-const MARGIN_REGEN_PER_SECOND = 3;
+// Margin regen follows WoW's "five-second rule": casting interrupts regen, so
+// margin only ticks back up once you've held off for MARGIN_REGEN_DELAY_MS. To
+// compensate for the downtime, the regen rate is bumped 25% over the old 3/s.
+const MARGIN_REGEN_PER_SECOND = 3.75;
+const MARGIN_REGEN_DELAY_MS = 1500;
 
 // Global multiplier on all incoming stock damage. Below the boss's enrage
 // threshold it doubles — the bear thrashes harder as it dies.
@@ -314,13 +319,20 @@ export function reducer(state: GameState, action: Action): GameState {
         };
       }
 
+      // Five-second rule: margin only regenerates once no spell has been cast
+      // for MARGIN_REGEN_DELAY_MS.
+      const regenAllowed =
+        state.lastCastAt === undefined ||
+        action.now - state.lastCastAt >= MARGIN_REGEN_DELAY_MS;
       let next: GameState = {
         ...state,
         now: action.now,
-        margin: Math.min(
-          state.maxMargin,
-          state.margin + (MARGIN_REGEN_PER_SECOND * action.dt) / 1000,
-        ),
+        margin: regenAllowed
+          ? Math.min(
+              state.maxMargin,
+              state.margin + (MARGIN_REGEN_PER_SECOND * action.dt) / 1000,
+            )
+          : state.margin,
       };
 
       if (next.cast && action.now >= next.cast.endsAt) {
@@ -461,6 +473,7 @@ function completeCast(state: GameState, now: number): GameState {
     ...state,
     margin: Math.max(0, state.margin - spell.marginCost),
     cast: undefined,
+    lastCastAt: now,
     stocks: {
       ...state.stocks,
       [state.cast.targetId]: {
