@@ -114,16 +114,47 @@ const BOSS_MAX_HP = 100;
 // every death you let happen slows the kill (and a wipe ends the fight).
 const BOSS_HIT_MIN_MS = 500;
 const BOSS_HIT_MAX_MS = 1200;
-// Chip damage to the boss, scaled by alive-fraction (raised to this power) at
-// hit time — so the more of the market has died, the sharply less damage the
-// boss takes. A bleeding market barely scratches it; a healthy one kills it in
-// ~7 minutes. The steep exponent is what makes neglect a losing strategy.
+// Chip damage to the boss, scaled by the alive-fraction at hit time via
+// bossDamageMultiplier() — DPS falls off mostly linearly as stocks die, then
+// drops sharply once the market is in tatters. A healthy market kills the boss
+// in ~7 minutes; a collapsing one barely scratches it.
 const BOSS_HIT_DMG_MIN = 0.105;
 const BOSS_HIT_DMG_MAX = 0.3;
-const BOSS_DPS_ALIVE_EXP = 5;
+// Below this alive-fraction the raid is "in tatters" and DPS falls off fast
+// instead of linearly; KNEE_MULT is the damage multiplier exactly at the knee.
+const BOSS_DPS_KNEE = 0.3;
+const BOSS_DPS_KNEE_MULT = 0.4;
+// How much the surviving market's *cap* (vs. raw headcount) weights boss damage.
+// Finviz encodes market cap as box area, so we use each stock's w*h as a cap
+// proxy: keeping the mega-caps (NVDA, GOOGL) alive lands more damage than the
+// same number of small caps. Kept moderate so headcount still dominates.
+const BOSS_DPS_MARKETCAP_WEIGHT = 0.4;
 // Guaranteed minimum chip per hit while at least one stock is alive, so a badly
 // wounded market still makes slow-but-real progress instead of stalling at zero.
 const BOSS_HIT_DMG_FLOOR = 0.03;
+
+// Market cap proxy per stock (Finviz box area) and the market total, used to
+// weight boss damage toward keeping high-cap stocks alive.
+const STOCK_MARKET_CAP: Record<StockId, number> = Object.fromEntries(
+  stocks.map((s) => [s.id, s.w * s.h]),
+);
+const TOTAL_MARKET_CAP = stocks.reduce((sum, s) => sum + s.w * s.h, 0);
+
+// Maps the surviving-market fraction (0..1) to a boss-damage multiplier (0..1).
+// Roughly linear from full down to the knee — losing a third of the market is a
+// proportional, not catastrophic, DPS loss — then falls off quadratically below
+// the knee so a market in tatters can't limp the boss down.
+function bossDamageMultiplier(aliveFraction: number): number {
+  if (aliveFraction >= BOSS_DPS_KNEE) {
+    return (
+      BOSS_DPS_KNEE_MULT +
+      (1 - BOSS_DPS_KNEE_MULT) *
+        ((aliveFraction - BOSS_DPS_KNEE) / (1 - BOSS_DPS_KNEE))
+    );
+  }
+  const t = aliveFraction / BOSS_DPS_KNEE;
+  return BOSS_DPS_KNEE_MULT * t * t;
+}
 
 // Things a panicked raider yells when they're hurting.
 const CHAT_LINES = [
@@ -337,13 +368,24 @@ export function reducer(state: GameState, action: Action): GameState {
       ).length;
 
       // The boss chips down over time; the more of the market is dead, the
-      // fewer fighters are left, so the less damage it takes.
+      // fewer fighters are left, so the less damage it takes. The surviving
+      // market's cap moderately weights this: keeping the mega-caps alive lands
+      // more damage than keeping the same number of small caps.
       if (action.now >= next.nextBossHitAt) {
-        const aliveFraction =
+        const aliveCountFraction =
           stocks.length > 0 ? aliveCount / stocks.length : 0;
+        let aliveMarketCap = 0;
+        for (const s of stocks) {
+          if (next.stocks[s.id]?.alive) aliveMarketCap += STOCK_MARKET_CAP[s.id];
+        }
+        const aliveCapFraction =
+          TOTAL_MARKET_CAP > 0 ? aliveMarketCap / TOTAL_MARKET_CAP : 0;
+        const aliveFraction =
+          aliveCountFraction * (1 - BOSS_DPS_MARKETCAP_WEIGHT) +
+          aliveCapFraction * BOSS_DPS_MARKETCAP_WEIGHT;
         const scaled =
           randomBetween(BOSS_HIT_DMG_MIN, BOSS_HIT_DMG_MAX) *
-          Math.pow(aliveFraction, BOSS_DPS_ALIVE_EXP);
+          bossDamageMultiplier(aliveFraction);
         // Always deal at least the floor while any stock is alive.
         const hit = aliveCount > 0 ? Math.max(BOSS_HIT_DMG_FLOOR, scaled) : 0;
         next = {
